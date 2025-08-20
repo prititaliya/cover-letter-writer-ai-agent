@@ -4,7 +4,7 @@
 
 Below is a preview of the app:
 
-![Cover Letter Assistant Screenshot](./screenshot.png)
+![Cover Letter Assistant Screenshot](Screenshot.png)
 
 A Streamlit web app powered by AI to generate tailored cover letters from your resume and a job description URL.
 
