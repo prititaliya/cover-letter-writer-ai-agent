@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+*.sqlite3
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Environment
+.env
+.env.*
+.venv/
+venv/
+
+# Streamlit
+.streamlit/
+
+# FAISS and indexes
+fiass_index/
+jd_faiss_index_*/
+
+# PDF uploads (temp)
+*.pdf
+
+# OS
+.DS_Store
+
+# Misc
+requirements.txt.bak
