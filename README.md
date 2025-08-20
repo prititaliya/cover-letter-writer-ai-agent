@@ -1,6 +1,10 @@
 # Cover Letter Assistant
 
-![Cover Letter Assistant Screenshot](screenshot.png)
+## Screenshot
+
+Below is a preview of the app:
+
+![Cover Letter Assistant Screenshot](./screenshot.png)
 
 A Streamlit web app powered by AI to generate tailored cover letters from your resume and a job description URL.
 
@@ -27,9 +31,6 @@ A Streamlit web app powered by AI to generate tailored cover letters from your r
    streamlit run streamlit_app.py
    ```
 4. Open the web interface, upload your resume, and paste the job description URL.
-
-## Screenshot
-Add your screenshot as `screenshot.png` in the project root to display it above.
 
 ## Project Structure
 ```
