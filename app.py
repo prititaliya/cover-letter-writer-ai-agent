@@ -1,7 +1,11 @@
+from time import time
 from dotenv import load_dotenv
 from pydantic import BaseModel
 load_dotenv()
+from langgraph.types import interrupt,Command
 import vertexai
+from langgraph.checkpoint.memory import MemorySaver
+
 
 vertexai.init(project="Generative Language API Key", location="us-central1")
 import hashlib
@@ -11,12 +15,12 @@ from typing import TypedDict
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader,WebBaseLoader
 from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage,ToolMessage
 from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import Annotated, TypedDict, final
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode
 from langchain_community.tools import DuckDuckGoSearchResults
@@ -25,44 +29,39 @@ class gen_structure(TypedDict):
     content:Annotated[str, "The content of the generated cover letter"]
     critism:Annotated[str, "Any criticism or feedback on the generated cover letter"]
     
-
+model_name="gpt-4o-mini"
 gen_model = init_chat_model(
-    model="gpt-4o-mini",  
+    model=model_name,
     temperature=0.2,
 )
 gen_model = gen_model.with_structured_output(gen_structure)
-# review_model=init_chat_model(
-#     model="gemini-2.5-flash"
-# )
 class cvState(TypedDict):
-    resume_vectorstore: FAISS
-    resume_text:str
-    resume_retriver: FAISS
-    resume_path: str
-    cover_letter: str
-    jd_url: str
-    jd_text: str
-    jd_vectorstore: FAISS
-    jd_retriver: FAISS
-    satisfied: bool
-    message: add_messages
-    iterations:int
+    resume_path: str                
+    resume_text: str                
+    resume_store_path: str          
 
+    jd_url: str       
+    jd_text: str      
+    jd_store_path: str
+
+    cover_letter: str
+    satisfied: bool                 
+    message: add_messages           
+    iterations: int       
+    
 def load_resume(state: cvState):
-    # Load the resume content from the state
-    persist_dir="fiass_index"
+    persist_dir="chroma_resume"
     is_available=False
     if os.path.exists(persist_dir):
-        resume_vectorstore = FAISS.load_local(persist_dir, OpenAIEmbeddings(), allow_dangerous_deserialization=True)
+        resume_vectorstore = Chroma(persist_directory=persist_dir, embedding_function=OpenAIEmbeddings())
         is_available=True
         
-        docs = resume_vectorstore.docstore._dict.values()
+        data = resume_vectorstore.get()
 
-        all_text = " ".join([doc.page_content for doc in docs])
-        
+        docs = data["documents"]
+        all_text = " ".join([doc for doc in docs])
         return {
-            "resume_vectorstore": resume_vectorstore,
-            "resume_retriver": resume_vectorstore.as_retriever(),
+            "resume_store_path": persist_dir,
             "resume_text": all_text
         }
     if not is_available:
@@ -80,72 +79,101 @@ def load_resume(state: cvState):
         if is_available:
             resume_vectorstore.add_documents(chunks)
         else:
-            resume_vectorstore = FAISS.from_documents(chunks, OpenAIEmbeddings())
+            resume_vectorstore = Chroma.from_documents(chunks, OpenAIEmbeddings(),
+                                                       persist_directory=persist_dir)
 
         # Persist index
-        resume_vectorstore.save_local(persist_dir)
-        docs = resume_vectorstore.docstore._dict.values()
+        resume_vectorstore.persist()
+        data = resume_vectorstore.get()
 
-        all_text = " ".join([doc.page_content for doc in docs])
+        docs = data["documents"]
+        all_text = " ".join([doc for doc in docs])
         return {
-            "resume_vectorstore": resume_vectorstore,
-            "resume_retriver": resume_vectorstore.as_retriever(),
+            "resume_store_path": persist_dir,
             "resume_text": all_text
         }
 
 def jd_loader(state:cvState):
-    # Load the job description content from the state
-    jd_hash = hashlib.sha256(state['jd_url'].encode('utf-8')).hexdigest()
-    persist_dir = f"jd_faiss_index_{jd_hash}"
-    is_available=False
-    if os.path.exists(persist_dir):
-        jd_vectorstore = FAISS.load_local(persist_dir, OpenAIEmbeddings(), allow_dangerous_deserialization=True)
-        is_available=True
-
-        docs = jd_vectorstore.docstore._dict.values()
-        all_text = " ".join([doc.page_content for doc in docs])
-
+    # Handle direct text input (when jd_text is provided and jd_url is empty)
+    if state.get('jd_text') and not state.get('jd_url'):
+        jd_text = state['jd_text']
+        jd_hash = hashlib.sha256(jd_text.encode('utf-8')).hexdigest()
+        persist_dir = f"jd_Chroma_index_{jd_hash}"
+        
+        # Create documents from the direct text
+        from langchain.schema import Document
+        doc = Document(page_content=jd_text, metadata={'source': 'direct_input'})
+        
+        splitters = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        chunks = splitters.split_documents([doc])
+        
+        for chunk in chunks:
+            chunk.metadata['hash'] = jd_hash
+        
+        jd_vectorstore = Chroma.from_documents(chunks, OpenAIEmbeddings(),
+                                               persist_directory=persist_dir)
+        jd_vectorstore.persist()
+        
         return {
-            "jd_vectorstore": jd_vectorstore,
-            "jd_retriver": jd_vectorstore.as_retriever(),
-            "jd_text": all_text
+            "jd_store_path": persist_dir,
+            "jd_text": jd_text
         }
     
-    if not is_available:
-        doc=WebBaseLoader(state['jd_url']).load()
-        jd_text=" ".join([d.page_content for d in doc])
-        jd_hash=hashlib.sha256(jd_text.encode('utf-8')).hexdigest()
+    # Handle URL-based input (existing functionality)
+    elif state.get('jd_url'):
+        jd_hash = hashlib.sha256(state['jd_url'].encode('utf-8')).hexdigest()
+        persist_dir = f"jd_Chroma_index_{jd_hash}"
+        is_available=False
+        if os.path.exists(persist_dir):
+            jd_vectorstore = Chroma(persist_directory=persist_dir, embedding_function=OpenAIEmbeddings())
+            is_available=True
+            data = jd_vectorstore.get()
 
-        splitters=RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-        chunks=splitters.split_documents(doc)
-
-        for chunk in chunks:
-            chunk.metadata['hash']=jd_hash
-
-        if is_available:
-            jd_vectorstore.add_documents(chunks)
-        else:
-            jd_vectorstore = FAISS.from_documents(chunks, OpenAIEmbeddings())
-
-        # Persist index
-        jd_vectorstore.save_local(persist_dir)
+            docs = data["documents"]
+            all_text = " ".join([doc for doc in docs])
+            return {
+                "jd_store_path": persist_dir,
+                "jd_text": all_text
+            }
         
-        
-        docs = jd_vectorstore.docstore._dict.values()
-        all_text = " ".join([doc.page_content for doc in docs])
-        
-        return {
-            "jd_vectorstore": jd_vectorstore,
-            "jd_retriver": jd_vectorstore.as_retriever(),
-            "jd_text": all_text
-        }
+        if not is_available:
+            doc=WebBaseLoader(state['jd_url']).load()
+            jd_text=" ".join([d.page_content for d in doc])
+            jd_hash=hashlib.sha256(jd_text.encode('utf-8')).hexdigest()
+
+            splitters=RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+            chunks=splitters.split_documents(doc)
+
+            for chunk in chunks:
+                chunk.metadata['hash']=jd_hash
+
+            if is_available:
+                jd_vectorstore.add_documents(chunks)
+            else:
+                jd_vectorstore = Chroma.from_documents(chunks, OpenAIEmbeddings(),
+                                                       persist_directory=persist_dir)
+
+            # Persist index
+            jd_vectorstore.persist()
+
+            data = jd_vectorstore.get()
+
+            docs = data["documents"]
+            all_text = " ".join([doc for doc in docs])
+            
+            return {
+                "jd_store_path": persist_dir,
+                "jd_text": all_text
+            }
+    else:
+        raise ValueError("Either jd_url or jd_text must be provided")
 
 
 def generate_cover_letter(state:cvState):
     resume_text = state['resume_text']
     jd_text = state['jd_text']
-
     system_msg = f"""You are an expert cover letter writer who helps job applicants create compelling, authentic cover letters that sound genuinely like them while getting noticed by hiring managers. Your approach is based on Harvard Business Review's proven methodology for effective cover letters.
+    Take all Personal details from resume as needed, and take all relevant information from job description.
 
     Core Principles
 
@@ -266,18 +294,31 @@ def generate_cover_letter(state:cvState):
 
     JOB DESCRIPTION:
     {jd_text}"""
+    
     cover_letter = gen_model.invoke(system_msg)
-
     return {
         "cover_letter": cover_letter,
-        'iterations':state['iterations'] + 1
+        "iterations": state['iterations'] + 1
     }
+    
 def check_condition(state:cvState):
      if(state['iterations'] > 5 or state['satisfied']):
         return END
      else:
         return 'continue'
+
 def review_cover_letter_condition(state:cvState):
+    human_approval=interrupt("Enhance the cover letter yes or no")
+    if human_approval.lower() == "no":
+       return Command(
+            goto=END,
+            update={
+                "cover_letter": cover_letter,
+                "iterations": state['iterations'] + 1,
+                "satisfied":True
+            }
+        )
+        
     resume=state['resume_text']
     job_description=state['jd_text']
     cover_letter=state['cover_letter']
@@ -289,7 +330,10 @@ def review_cover_letter_condition(state:cvState):
         authenticity_and_voice: str
         structure_and_execution: str
 
-    model=init_chat_model(model='gpt-4o-mini').with_structured_output(coverLetterAnalyser)
+    model=init_chat_model(
+    model=model_name,  
+    temperature=0.2,
+).with_structured_output(coverLetterAnalyser)
 
     system_msg = f"""You are an expert cover letter analyst and career coach specializing in evaluating cover letters against Harvard Business Review's proven methodology. Your role is to provide comprehensive, actionable feedback to help improve cover letter effectiveness.
 
@@ -372,7 +416,6 @@ def review_cover_letter_condition(state:cvState):
     {resume}"""
     
     response = model.invoke([SystemMessage(content=system_msg)])
-    print(response)
     if response['overall'] < 90:
         return {
             "satisfied": False,
@@ -395,20 +438,23 @@ graph.add_node('load_resume',load_resume)
 graph.add_node('jd_loader',jd_loader)
 graph.add_node('generate_cover_letter',generate_cover_letter)
 graph.add_node('review_cover_letter_condition', review_cover_letter_condition)
-
-
 graph.add_edge(START,'load_resume')
 graph.add_edge(START,'jd_loader')
 graph.add_edge('load_resume','generate_cover_letter')
 graph.add_edge('jd_loader','generate_cover_letter')
 graph.add_edge('generate_cover_letter','review_cover_letter_condition')
+graph.add_edge('generate_cover_letter',END)
 graph.add_conditional_edges('review_cover_letter_condition',check_condition,{
     END:END,
     'continue':'generate_cover_letter'
 })
 
-
-app=graph.compile()
+config={
+    'configurable':{
+        'thread_id':10
+    }
+}
+app=graph.compile(checkpointer=MemorySaver())
 
 # Export app for import in streamlit_app.py
 __all__ = ["app"]
@@ -419,5 +465,14 @@ init_state={
     'iterations':0,
     'message':[]
 }
-final_state=app.invoke(init_state)
-print(final_state['cover_letter'])
+final_state=app.invoke(init_state,config=config,stream_mode='updates')
+# print(final_state['cover_letter'])
+
+while((app.get_state(config) !=())):
+    user_input = input("Do you want to enhance your resume more? ")
+    if user_input.lower() == "yes":
+        final_state=app.invoke(Command(resume="yes"),config=config,stream_mode='updates')
+    else:
+      break
+
+print(final_state[-2]['generate_cover_letter']['cover_letter']['content'])
